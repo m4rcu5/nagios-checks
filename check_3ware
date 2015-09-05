@@ -1,0 +1,134 @@
+#!/bin/sh
+#
+# check_3ware.sh
+#
+# Based on the works of Sander Klein.
+# Rewritten to work with bash and busybox sh.
+#
+
+TWCLI='/vmfs/volumes/d.r0.ssd/tw_cli'
+EXITCODE=0
+BBUEXITCODE=0
+
+# Exit unknown if no tw_cli
+[ ! -x $TWCLI ] && exit 3
+
+# Find out which controllers are available...
+CONTROLLERS=$($TWCLI info | grep -E "^c" | awk '{print $1}')
+
+for CTRL in $CONTROLLERS; do
+	# Create an array containing the units
+	COUNT=0
+	for UNIT in $($TWCLI info $CTRL unitstatus | grep -E "^u" | awk '{print $1}'); do
+		eval UNITS$COUNT=$UNIT
+		let COUNT=$COUNT+1
+	done
+
+	#
+	# UNIT Testing
+	#
+
+	# Look for status of all units
+	UNITSTATUS=$($TWCLI info $CTRL unitstatus | grep -E "^u" | awk '{print $3}')
+
+	# Loop over units and their status
+	COUNT=0
+	for STATUS in $UNITSTATUS; do
+		case "$STATUS" in
+			OK)
+				CHECKUNIT=$($TWCLI info $CTRL unitstatus | grep -E "$(eval echo \$UNITS$COUNT)" | awk '{print $1,$3}')
+				STATUS="/$CTRL/$CHECKUNIT"
+				MSG="$MSG $STATUS -"
+				PREEXITCODE=0
+				;;
+			VERIFYING)
+				CHECKUNIT=$($TWCLI info $CTRL unitstatus | grep -E "$(eval echo \$UNITS$COUNT)" | awk '{print $1,$3,$5}')
+				STATUS="/$CTRL/$CHECKUNIT"
+				MSG="$MSG $STATUS -"
+				PREEXITCODE=0
+				;;
+			REBUILDING)
+				CHECKUNIT=$($TWCLI info $CTRL unitstatus | grep -E "$(eval echo \$UNITS$COUNT)" | awk '{print $1,$3,$4}')
+				STATUS="/$CTRL/$CHECKUNIT%"
+				MSG="$MSG $STATUS -"
+				PREEXITCODE=1
+				;;
+			DEGRADED)
+				CHECKUNIT=$($TWCLI info $CTRL unitstatus | grep -E "$(eval echo \$UNITS$COUNT)" | awk '{print $1,$3}')
+				STATUS="/$CTRL/$CHECKUNIT"
+
+				# Check which disk has failed
+				DRIVE=$($TWCLI info $CTRL drivestatus | grep -E "$(eval echo \$UNITS$COUNT)" | grep -v -i "OK" | awk '{print $1,$2}')
+				MSG="$MSG $STATUS Reason: $DRIVE -"
+				PREEXITCODE=2
+				;;
+			*)
+				CHECKUNIT=$($TWCLI info $CTRL unitstatus | grep -E "$(eval echo \$UNITS$COUNT)")
+				STATUS="/$CTRL/$CHECKUNIT"
+				MSG="$MSG $STATUS -"
+				PREEXITCODE=3
+				;;
+		esac
+
+		# Make sure we always exit with the most important warning
+		# OK is least and UNKNOWN is the most important in this case
+		if [ $PREEXITCODE -gt $EXITCODE ]; then
+			EXITCODE=$PREEXITCODE
+		fi
+
+		let COUNT=$COUNT+1
+	done
+
+	#
+	# BBU Testing
+	#
+
+	# Name  OnlineState  BBUReady  Status    Volt     Temp     Hours  LastCapTest
+	# ---------------------------------------------------------------------------
+	# bbu   On           Yes       OK        OK       OK       0      xx-xxx-xxxx
+	# bbu   On           No        Charging  OK       OK       255    02-Sep-2010
+
+	# Assign BBU's output for comparison
+	COUNT=0
+	for BBUSTATUS in $($TWCLI info $CTRL |grep -E "^bbu"|awk '{print $1,$2,$3,$4,$5,$6}'); do
+		eval BBU$COUNT=$BBUSTATUS
+		let COUNT=$COUNT+1
+	done
+
+	# Check BBU's status
+	if [ "$BBU0" = "bbu" ]; then
+		if [ "$BBU2" = "No" ] && ( [ "$BBU3" = "Testing" ] || [ "$BBU3" = "Charging" ] ); then
+			BBUEXITCODE=1
+			BBUWARNING="BBU on $CTRL is $BBU3"
+		else
+			if [ "$BBU1" != "On" ] || [ "$BBU2" != "Yes" ] || [[ "$BBU3" != "OK" && "$BBU3" != "Testing" ]] || [ "$BBU4" != "OK" ] || [ "$BBU5" != "OK" ]; then
+				BBUEXITCODE=2
+				BBUERROR="BBU on $CTRL failed"
+			fi
+		fi
+	fi
+done
+
+# See which one is in a worse state
+if [ $EXITCODE -lt $BBUEXITCODE ]; then
+	EXITCODE=$BBUEXITCODE
+fi
+
+case "$EXITCODE" in
+	0)
+		echo "UNITS OK: $MSG"
+		exit 0
+		;;
+	1)
+		echo "WARNING: $BBUWARNING$MSG"
+		exit 1
+		;;
+	2)
+		echo "CRITICAL: $BBUERROR$MSG"
+		exit 2
+		;;
+	*)
+		echo "UNKNOWN: $MSG"
+		exit 3
+		;;
+esac
